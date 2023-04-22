@@ -1,0 +1,395 @@
+
+library(shiny)
+library(dplyr)
+
+ui <- fluidPage(
+  titlePanel("Automated AJCC Restaging for Oropharyngeal Cancer Research"),
+  
+  tags$div(
+    style = "text-align:left; margin-top: 20px;",
+    HTML(
+      "<p>This conversion algorithm is outlined in \"<b>Automated AJCC Restaging for Oropharyngeal Cancer Research</b>\" by Safranek et. al. The algorithm converts human papillomavirus positive (HPV+) oropharyngeal squamous cell carcinoma (OPSCC) pathologically and clinically staged tumor (T), node (N), and metastasis (M) values from 7th to 8th edition American Joint Committee on Cancer (AJCC) staging criteria. It then applies the AJCC 8th edition criteria to convert TNM values to an updated pathological, clinical, and overall final OPSCC stage (see Figure 1 from Safranek et. al. for schematic overview of these steps). 
+      </p></p>To use this algorithm, upload a comma-separated values (CSV) file with the following columns and column header names, labeled exactly as they are listed in brackets below (e.g. 'record_id').
+      <ul>
+        <li><b>Record ID [record_id]:</b> Unique identifier for each case (protected health information deidentification instructions included in Instructional PDF linked below).</li>
+        <li><b>Clinical Tumor Value [cT]:</b> Tumor value for each case, according to clinical staging AJCC 7th edition criteria.</li>
+        <li><b>Clinical Node Value [cN]:</b> Node value for each case, according to clinical staging AJCC 7th edition criteria.</li>
+        <li><b>Pathologic Tumor Value [pT]:</b> Tumor value for each case, according to pathological staging AJCC 7th edition criteria.</li>
+        <li><b>Pathologic Node Value [pN]:</b> Node value for each case, according to pathological staging AJCC 7th edition criteria.</li>
+        <li><b>Metastasis Value [M]:</b> Metastasis value, according to clinical staging AJCC 7th edition criteria.</li>
+        <li><b>Number of positive lymph nodes [node_positive_num]:</b> For cases that included a neck dissection, this is the number of lymph nodes that were positive.</li>
+      </ul>
+      
+      
+      </p></p></p></p>Please find additional detailed instructions for applying this algorithm in the following <b>Instruction Manual</b>: <a href='https://drive.google.com/file/d/1mMeKoJ7YdHeBCPnxwMfb94LS8ATNGlqJ/view?usp=share_link'>https://drive.google.com/file/d/1mMeKoJ7YdHeBCPnxwMfb94LS8ATNGlqJ/view?usp=share_link</a>.</p>
+      </p></p>
+      "
+    )
+  ),
+  
+  sidebarLayout(
+    sidebarPanel(
+      fileInput("file", "Choose a file to upload (.xlsx or .csv)",
+                accept = c(".xlsx", ".csv")),
+      
+      downloadButton("downloadData", "Download Full Restaged Data")
+    ),
+    
+    mainPanel(
+      tableOutput("new_table")
+    )
+  )
+)
+
+server <- function(input, output) {
+  options(shiny.maxRequestSize=30*1024^2)
+  
+  # Define data4 outside of reactive function
+  data4 <- NULL
+  
+  data <- reactive({
+    req(input$file)
+    if (grepl(".csv$", input$file$name)) {
+      data <- read.csv(input$file$datapath)
+    } else {
+      data <- readxl::read_excel(input$file$datapath)
+    }
+    
+    
+    data2 <- data
+    
+    ################################################################
+    
+    #Create column to record the error type for missing or non-compatible data inputs
+    data <- data %>% mutate(Error_PathNodeValue = "")
+    data <- data %>% mutate(Error_ClinNodeValue = "")
+    data <- data %>% mutate(Error_PathTumorValue  = "")
+    data <- data %>% mutate(Error_ClinTumorValue  = "")
+    data <- data %>% mutate(Error_TumorInSitu  = "")
+    data <- data %>% mutate(Error_MetastasisValue  = "")
+    
+    
+    ##############################################################
+    #Create column for whether it is possible to determine pathological stage:
+    
+    #   If there is no path stage info for pN, OR it was pathologically staged 
+    #     but pN is NX, then it  clinical node stage.
+    data <- data %>%
+      mutate(pathStaged = 
+               ifelse(pN %in% c("", " ", "NX","Nx","nx","X","x") | is.na(pN), 0, 1),
+             .after = node_positive_num)
+    
+    #   Some cases do not have a N value in the pN column, but did have a neck 
+    #     dissection with a value for "node_positive_num". These cases can  
+    #     potentially be pathologically staged (assuming they have a T value etc.)
+    data$pathStaged[(data$node_positive_num >= 0 & data$node_positive_num < 95)] <- 1
+    
+    
+    
+    ##############################################################
+    #Pathological Node Restaging:
+    
+    #Create updated "pn_8_new" column for 8th ed path node restaging
+    data <- data %>% mutate(pn_8_new = "", .after = pathStaged)
+    data$pn_8_new[data$pathStaged == 0] <- NA
+    
+    
+    #N1 and N2a (both of which have 1 positive LN) become N1
+    data$pn_8_new[data$pN %in% c("1","N1","n1",
+                                 "2a", "2A","N2a","n2A","N2A","n2a")] <- "N1"
+    
+    #Also former N2b, N2c, or N3 with ≤ 4 overall lymph nodes also become N1 (note, N0 staging comes later and overwrites for cases with < 5 because it's 0 positive lymph)
+    data$pn_8_new[data$node_positive_num < 5] <- "N1"
+    
+    #If > 4 LNs then N2 automatically (no N3 anymore)
+    data$pn_8_new[data$node_positive_num > 4] <- "N2"
+    
+    #N0 stays N0
+    data$pn_8_new[data$pN %in% c("0","N0","n0") | data$node_positive_num == 0] <- "N0" 
+    
+    #If expecting a value for pN but it's missing or invalid, record error:
+    data$Error_PathNodeValue[data$pathStaged == 1 & (is.na(data$pn_8_new) | data$pn_8_new == "")] <- 1
+    
+    
+    ##############################################################
+    #Clinical Node Restaging:
+    
+    #For cases that need to re-staged and will be clinically staged, create updated cn_8_new value
+    data <- data %>% mutate(cn_8_new = "", .after = pn_8_new)
+    data$cn_8_new[data$pathStaged != 0] <- NA 
+    
+    #N1, N2a, and N2b are combined to N1
+    data$cn_8_new[data$cN %in% c("1","N1","n1",
+                                 "2a","2A","N2a","N2A","n2a","n2A",
+                                 "2b","2B","N2b","N2B","n2b","n2B")] <- "N1"
+    
+    #N2c --> N2
+    data$cn_8_new[data$cN %in% c("2c","2C",
+                                 "N2c","n2C","N2C","n2c")] <- "N2"
+    
+    #N0 stays N0
+    data$cn_8_new[data$cN %in% c("0","N0","n0")] <- "N0"
+    
+    #N3 stays N3
+    data$cn_8_new[data$cN %in% c("3","N3","n3")] <- "N3"
+    
+    #If expecting a value for cN but it's missing or invalid, record error:
+    data$Error_ClinNodeValue[data$pathStaged == 0 & (is.na(data$cn_8_new) | data$cn_8_new == "")] <- 1
+    
+    
+    ##############################################################
+    #Tumor Restaging (Pathological):
+    
+    #For cases that need to re-staged, create updated pt_8_new value
+    data <- data %>% mutate(pt_8_new = "", .after = cn_8_new)
+    
+    #T0 stays T0
+    data$pt_8_new[data$pT %in% c("0","T0","t0")] <- "T0"
+    
+    #T1 stays T1, T2 stays T2, and T3 stays T3
+    data$pt_8_new[data$pT %in% c("1", "T1", "t1")] <- "T1"
+    data$pt_8_new[data$pT %in% c("2", "T2", "t2")] <- "T2"
+    data$pt_8_new[data$pT %in% c("3", "T3", "t3")] <- "T3"
+    
+    #All locally advanced combined to T4:
+    data$pt_8_new[data$pT %in% c("4","T4","t4", 
+                                 "4a","4A","T4a","t4A","t4a","T4A",
+                                 "4b","4B","T4b","t4B","t4b","T4B")] <- "T4"
+    
+    #T values representing "in situ" primaries removed from AJCC 8th ed HPV+ oropharyngeal cancer
+    data$pt_8_new[data$pT %in% c("IS", "is","Is","iS",
+                                 "I S", "i s", "I s", "i S",
+                                 "in situ", "In Situ", "In situ", "in Situ",
+                                 "insitu", "InSitu", "Insitu", "inSitu")] <- "XXX_inSitu_XXX"
+    
+    #If pathological T value is missing or invalid, record error:
+    data$Error_PathTumorValue[data$pathStaged == 1 & 
+                                (data$pt_8_new == "" | is.na(data$pt_8_new))] <- 1
+    
+    ##############################################################
+    #Tumor Restaging (Clinical):
+    #Note: this has same restaging criteria/rules as pathological tumor (pT) values
+    
+    #For cases that need to re-staged, create updated ct_8_new value
+    data <- data %>% mutate(ct_8_new = "", .after = pt_8_new)
+    
+    #T0 stays T0
+    data$ct_8_new[data$cT %in% c("0","T0","t0")] <- "T0"
+    
+    #T1 stays T1, T2 stays T2, and T3 stays T3
+    data$ct_8_new[data$cT %in% c("1", "T1", "t1")] <- "T1"
+    data$ct_8_new[data$cT %in% c("2", "T2", "t2")] <- "T2"
+    data$ct_8_new[data$cT %in% c("3", "T3", "t3")] <- "T3"
+    
+    #All locally advanced combined to T4:
+    data$ct_8_new[data$cT %in% c("4","T4","t4", 
+                                 "4a","4A","T4a","t4A","t4a","T4A",
+                                 "4b","4B","T4b","t4B","t4b","T4B")] <- "T4"
+    
+    #T values representing "in situ" primaries removed from AJCC 8th ed HPV+ oropharyngeal cancer
+    data$ct_8_new[data$cT %in% c("IS", "is","Is","iS",
+                                 "I S", "i s", "I s", "i S",
+                                 "in situ", "In Situ", "In situ", "in Situ",
+                                 "insitu", "InSitu", "Insitu", "inSitu")] <- "XXX_inSitu_XXX"
+    
+    #If clinical T value is missing or invalid, record error:
+    data$Error_ClinTumorValue[data$pathStaged != 1 &
+                                data$ct_8_new == "" | is.na(data$ct_8_new)] <- 1
+    
+    
+    #####################
+    #Record error message for cases with tumor stage "in situ":
+    data$Error_TumorInSitu[data$pt_8_new == "XXX_inSitu_XXX"] <- 1
+    data$Error_TumorInSitu[data$ct_8_new == "XXX_inSitu_XXX"] <- 1
+    
+    
+    
+    ##############################################################
+    #M Staging
+    data <- data %>% mutate(m_8_new = "", .after = pt_8_new)
+    data$m_8_new[data$M == "1" | data$M == "M1"  | data$M == "m1"] <- "M1"
+    
+    
+    
+    #If M value is invalid, record error:
+    #Note: No Error for missing M value because it is assumed that when this
+    #      field is left blank it means M = 0 (versus if Mx is recorded, it 
+    #      suggests it is unable to determine the M value)
+    data$Error_MetastasisValue[  (data$M != "" & !is.na(data$M)) & 
+                                   (data$M != "0" & data$M != "M0" & data$M != "m0") &
+                                   (data$m_8_new == "" | is.na(data$m_8_new))] <- 1
+    
+    
+    
+    
+    
+    ##############################################################
+    ########## FINAL RESTAGING of 7th --> 8th edition: ###########
+    ##############################################################
+    
+    
+    ##################################
+    #CLINICAL:
+    
+    data <- data %>% mutate(clinStage_ajcc8 = "", .after = m_8_new)
+    
+    
+    ##Stage I <-- T0, T1, or T2  +  N0 or N1
+    data$clinStage_ajcc8[(data$cn_8_new == "N0" | data$cn_8_new == "N1") &
+                           (data$ct_8_new == "T0" | data$ct_8_new == "T1" | data$ct_8_new == "T2")] <- 1
+    
+    ##Stage II <-- N2  +  (T0 or T1 or T2 or T3) 
+    data$clinStage_ajcc8[(data$cn_8_new == "N2") &
+                           (data$ct_8_new == "T0" | data$ct_8_new == "T1" | data$ct_8_new == "T2" | data$ct_8_new == "T3")] <- 2
+    ##Stage II <-- T3  +  (N0 or N1 or N2) 
+    data$clinStage_ajcc8[(data$cn_8_new == "N0" | data$cn_8_new == "N1" | data$cn_8_new == "N2") &
+                           (data$ct_8_new == "T3")] <- 2
+    
+    ##Stage III <-- any N3   or    any T4
+    data$clinStage_ajcc8[(data$cn_8_new == "N3" | data$ct_8_new == "T4")] <- 3
+    
+    
+    #CLINICAL subset staging:
+    #For some cases, they included a valid value for cN and pT, but not cT or pN. 
+    #    AJCC guidelines states that a primary tumor dissection is necessary for
+    #    pathological staging. However, based on the equivalency 
+    #    of pT and cT value determination in both AJCC 7th and 8th edition 
+    #    guidelines, for this subset of cases with cN and pT values, we translated
+    #    the pT value to a cT value and proceeded to stage the case clinically. See
+    #    more details (including specific examples) in note #4 of the supplemental
+    #    instructional pdf.
+    
+    ##Stage I <-- T0, T1, or T2  +  N0 or N1
+    data$clinStage_ajcc8[data$ct_8_new == "" &
+                           (data$cn_8_new == "N0" | data$cn_8_new == "N1") &
+                           (data$pt_8_new == "T0" | data$pt_8_new == "T1" | data$pt_8_new == "T2")] <- 1
+    
+    ##Stage II <-- N2  +  (T0 or T1 or T2 or T3) 
+    data$clinStage_ajcc8[data$ct_8_new == "" &
+                           (data$cn_8_new == "N2") &
+                           (data$pt_8_new == "T0" | data$pt_8_new == "T1" | data$pt_8_new == "T2" | data$pt_8_new == "T3")] <- 2
+    ##Stage II <-- T3  +  (N0 or N1 or N2) 
+    data$clinStage_ajcc8[data$ct_8_new == "" &
+                           (data$cn_8_new == "N0" | data$cn_8_new == "N1" | data$cn_8_new == "N2") &
+                           (data$pt_8_new == "T3")] <- 2
+    
+    ##Stage III <-- any N3   or    any T4
+    data$clinStage_ajcc8[data$ct_8_new == "" &
+                           (data$cn_8_new == "N3" | data$pt_8_new == "T4")] <- 3
+    
+    
+    
+    ##############################################################
+    #PATHOLOGICAL:
+    
+    data <- data %>% mutate(pathStage_ajcc8 = "", .after = m_8_new)
+    
+    
+    #Stage I <-- T0, T1, or T2  +  N0 or N1
+    data$pathStage_ajcc8[(data$pt_8_new == "T0" | data$pt_8_new == "T1" | data$pt_8_new == "T2") &
+                           (data$pn_8_new == "N0" | data$pn_8_new == "N1")] <- 1
+    
+    #Stage II <-- T0, T1, or T2  +  N2
+    data$pathStage_ajcc8[(data$pt_8_new == "T0" | data$pt_8_new == "T1" | data$pt_8_new == "T2") &
+                           (data$pn_8_new == "N2")] <- 2
+    #Stage II <-- T3 or T4  +  N0 or N1
+    data$pathStage_ajcc8[(data$pt_8_new == "T3" | data$pt_8_new == "T4") &
+                           (data$pn_8_new == "N0" | data$pn_8_new == "N1")] <- 2 
+    
+    #Stage III  <-- T3 or T4  +  N2
+    data$pathStage_ajcc8[(data$pt_8_new == "T3" | data$pt_8_new == "T4") &
+                           (data$pn_8_new == "N2")] <- 3                   
+    
+    
+
+    
+    ##############################################################
+    #Stage IV: METASTATIC (path or clinical):
+    #  (note, this code is after clin/path because any metastases overwrites both to Stage IV)
+    data$clinStage_ajcc8[data$m_8_new == "M1"] <- 4
+    data$pathStage_ajcc8[data$m_8_new == "M1" & data$pathStage_ajcc8 != ""] <- 4 ##DOUBLE CHECK THAT THIS UPDATED LINE WORKS!! ##############################################################
+    
+    
+    
+    ##############################################################
+    ##############################################################
+    #BEST AJCC
+    
+    #Select between clinical and pathological staging (Pathological is priority,
+    #   if available)
+    data <- data %>%
+      mutate(bestStage_ajcc8 = 
+               ifelse(pathStage_ajcc8 == "", clinStage_ajcc8, pathStage_ajcc8),
+             .after = m_8_new)
+    
+    #################
+    #Remove IN SITU: For AJCC 8th edition criteria, HPV+ OPSCC in situ is no 
+    #   longer staged. If clinical tumor value is "inSitu" and there is no path 
+    #   path stage, OR if pathological tumor value is "inSitu", then overall best
+    #   AJCC stage is "inSitu".
+    data$bestStage_ajcc8[  (data$ct_8_new == "XXX_inSitu_XXX" & (data$pathStage_ajcc8 == "" | is.na(data$pathStage_ajcc8))) |
+                             (data$pt_8_new == "XXX_inSitu_XXX")] <- "XXX_inSitu_XXX"
+    
+    ##############################################################
+    ##############################################################
+    ##############################################################
+    
+    
+    data3 <- data %>% select(record_id, pt_8_new, pn_8_new, ct_8_new, cn_8_new, m_8_new, clinStage_ajcc8, pathStage_ajcc8, bestStage_ajcc8, Error_PathTumorValue, Error_ClinTumorValue, Error_PathNodeValue, Error_ClinNodeValue, Error_MetastasisValue, Error_TumorInSitu)
+    
+    #Finalize join with original data set and assign to data4 global variable (<<-)
+    data4 <<- full_join(data2, data3, by = "record_id")
+    
+    
+    
+    #######################################################
+    #Creating summary statistics
+    
+    # Count the total number of cases
+    total_cases <- sum(!is.na(data4$record_id) & data4$record_id != "")
+    
+    # Count the total number of cases automatically staged
+    staged_cases <- sum(!is.na(data4$bestStage_ajcc8) & data4$bestStage_ajcc8 != "")
+    
+    # Count the number of cases with pathological staging
+    pathological_cases <- sum(!is.na(data4$pathStage_ajcc8) & data4$pathStage_ajcc8 != "")
+    
+    # Calculate the number of cases remaining unstaged
+    unstaged_cases <- total_cases - staged_cases
+    
+    # Calculate the percent of cases automatically staged
+    percent_staged <- format(round(staged_cases / total_cases * 100, 1), nsmall = 1, digits = 2) # Rounded to 1 decimal place with a percent symbol
+    
+    # Calculate the percent of restaged cases with pathological staging
+    percent_pathological <- format(round(pathological_cases / staged_cases * 100, 1), nsmall = 1, digits = 2) # Rounded to 1 decimal place with a percent symbol
+    
+    # Create a table with the computed values
+    table <- data.frame(
+      "Total Number of Cases" = format(total_cases, big.mark = ","),
+      "Total Number of Cases Automatically Staged" = format(staged_cases, big.mark = ","),
+      "Total Number of Cases Remaining Unstaged" = format(unstaged_cases, big.mark = ","),
+      "Percent of Cases Automatically Staged" = paste0(percent_staged, "%"), # Add percent symbol
+      "Percent of Restaged Cases with Pathological Staging" = paste0(percent_pathological, "%") # Add percent symbol
+    )
+    
+    # Print the table
+    table
+
+  })
+  
+  output$new_table <- renderTable({
+    data()
+  })
+  
+  output$downloadData <- downloadHandler(
+    filename = function() {
+      paste0(input$file$name,"_RestagedAJCC8.csv")
+    },
+    content = function(file) {
+      write.csv(data4, file, row.names = FALSE)
+    }
+  )
+}
+
+shinyApp(ui, server)
+
